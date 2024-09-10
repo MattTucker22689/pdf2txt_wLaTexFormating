@@ -1,71 +1,89 @@
 import os
+import fitz  # PyMuPDF
 import pytesseract
-from pdf2image import convert_from_path
 from PIL import Image
 import re
-import cv2
-import numpy as np
-from pix2tex.cli import LatexOCR
+import io
+from transformers import NougatProcessor, VisionEncoderDecoderModel
 
-# Set up directories
-input_dir = "./test_pdfs"
-output_dir = "./results"
-os.makedirs(output_dir, exist_ok=True)
+# Load the Nougat LaTeX model and processor
+processor = NougatProcessor.from_pretrained("Norm/nougat-latex-base")
+model = VisionEncoderDecoderModel.from_pretrained("Norm/nougat-latex-base")
 
-# Initialize LatexOCR
-latex_ocr = LatexOCR()
-
-def process_pdf(pdf_path):
-    pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    pdf_output_dir = os.path.join(output_dir, pdf_name)
-    os.makedirs(pdf_output_dir, exist_ok=True)
+# Function to extract text and equations using Nougat model
+def extract_text_and_equations_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    full_text = ""
     
-    # Convert PDF to images
-    images = convert_from_path(pdf_path)
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        
+        # Extract regular text
+        regular_text = page.get_text()
+        
+        # Convert the page to an image for equation extraction by the Nougat model
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Extract equations using Nougat model
+        inputs = processor(images=img, return_tensors="pt")
+        outputs = model.generate(**inputs, max_new_tokens=1024)
+        latex_output = processor.decode(outputs[0], skip_special_tokens=True)
+        
+        # Combine regular text and LaTeX output
+        combined_text = f"{regular_text}\n${latex_output}$\n"
+        full_text += combined_text
     
-    text_content = ""
+    return full_text
+
+# Function to extract images from PDF
+def extract_images_from_pdf(pdf_path, output_folder):
+    doc = fitz.open(pdf_path)
     image_count = 0
-    
-    for i, image in enumerate(images):
-        # Convert PIL Image to OpenCV format
-        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        
-        # Perform OCR
-        text = pytesseract.image_to_string(image)
-        
-        # Detect equations
-        gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if w > 50 and h > 20:  # Adjust these thresholds as needed
-                roi = opencv_image[y:y+h, x:x+w]
-                equation = latex_ocr(Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)))
-                text = text.replace(pytesseract.image_to_string(roi), f"$${equation}$$")
-        
-        # Detect and save images, graphs, and tables
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if w > 100 and h > 100:  # Adjust these thresholds as needed
-                roi = opencv_image[y:y+h, x:x+w]
-                image_count += 1
-                image_filename = f"image_{image_count}.png"
-                cv2.imwrite(os.path.join(pdf_output_dir, image_filename), roi)
-                text = text.replace(pytesseract.image_to_string(roi), f"[Image {image_count}]")
-        
-        text_content += text + "\n\n"
-    
-    # Write text content to file
-    with open(os.path.join(output_dir, f"{pdf_name}.txt"), "w", encoding="utf-8") as f:
-        f.write(text_content)
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image_path = os.path.join(output_folder, f"image_{page_num+1}_{img_index+1}.{image_ext}")
+            image.save(image_path)
+            image_count += 1
+    return image_count
 
-# Process all PDFs in the input directory
-for root, _, files in os.walk(input_dir):
-    for file in files:
-        if file.lower().endswith('.pdf'):
-            pdf_path = os.path.join(root, file)
-            process_pdf(pdf_path)
+# Function to save text to a file
+def save_text_to_file(text, file_path):
+    with open(file_path, "w", encoding="utf-8") as file:
+        file.write(text)
 
-print("Processing complete. Results are in the './results/' directory.")
+# Main function to process all PDFs
+def process_pdfs(input_folder, output_folder):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    image_output_folder = os.path.join(output_folder, "images")
+    if not os.path.exists(image_output_folder):
+        os.makedirs(image_output_folder)
+
+    for pdf_file in os.listdir(input_folder):
+        if pdf_file.endswith(".pdf"):
+            pdf_path = os.path.join(input_folder, pdf_file)
+            
+            # Extract text and LaTeX equations using Nougat model
+            text = extract_text_and_equations_from_pdf(pdf_path)
+            
+            # Extract images and save
+            image_count = extract_images_from_pdf(pdf_path, image_output_folder)
+            
+            # Save text output
+            text_file_path = os.path.join(output_folder, f"{os.path.splitext(pdf_file)[0]}.txt")
+            save_text_to_file(text, text_file_path)
+            print(f"Processed {pdf_file}: {image_count} images extracted")
+
+# Set input and output folders
+input_folder = "./test_pdfs"
+output_folder = "./results"
+
+process_pdfs(input_folder, output_folder)
